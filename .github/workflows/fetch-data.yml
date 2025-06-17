@@ -28,15 +28,6 @@ jobs:
         with:
           dotnet-version: '8.x'
 
-      - name: 🔍 Dump Electrometer env
-        run: |
-          echo "BASEURL='$ELECTROMETERSETTINGS__BASEURL'"
-          echo "LOGINURL='$ELECTROMETERSETTINGS__LOGINURL'"
-          echo "USERNAME='$ELECTROMETERSETTINGS__USERNAME'"
-          echo "PASSWORD='$ELECTROMETERSETTINGS__PASSWORD'"
-          echo "SYSSN='$ELECTROMETERSETTINGS__SYSSN'"
-          echo "STATIONID='$ELECTROMETERSETTINGS__STATIONID'"
-          echo "DB='$DATABASE__CONNECTIONSTRING'"
 
       - name: Restore & Build
         run: dotnet build ElektrometerService.sln --configuration Release
