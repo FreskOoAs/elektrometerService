@@ -9,7 +9,7 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
 
-    # Inject all secrets at the job level so every step sees them
+    # job-level injection: all steps will see these
     env:
       ELECTROMETERSETTINGS__BASEURL:      ${{ secrets.ELECTROMETERSETTINGS__BASEURL }}
       ELECTROMETERSETTINGS__LOGINURL:     ${{ secrets.ELECTROMETERSETTINGS__LOGINURL }}
