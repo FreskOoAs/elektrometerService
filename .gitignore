@@ -1,0 +1,11 @@
+# Visual Studio workspace files
+.vs/
+
+# Build output
+bin/
+obj/
+
+# User-specific files
+*.user
+*.suo
+*.vscode/
