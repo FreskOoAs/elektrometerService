@@ -9,6 +9,16 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
 
+    # Inject all secrets at the job level so every step sees them
+    env:
+      ELECTROMETERSETTINGS__BASEURL:      ${{ secrets.ELECTROMETERSETTINGS__BASEURL }}
+      ELECTROMETERSETTINGS__LOGINURL:     ${{ secrets.ELECTROMETERSETTINGS__LOGINURL }}
+      ELECTROMETERSETTINGS__USERNAME:     ${{ secrets.ELECTROMETERSETTINGS__USERNAME }}
+      ELECTROMETERSETTINGS__PASSWORD:     ${{ secrets.ELECTROMETERSETTINGS__PASSWORD }}
+      ELECTROMETERSETTINGS__SYSSN:        ${{ secrets.ELECTROMETERSETTINGS__SYSSN }}
+      ELECTROMETERSETTINGS__STATIONID:    ${{ secrets.ELECTROMETERSETTINGS__STATIONID }}
+      DATABASE__CONNECTIONSTRING:         ${{ secrets.DATABASE__CONNECTIONSTRING }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -18,26 +28,18 @@ jobs:
         with:
           dotnet-version: '8.x'
 
-      # ⚠️ Debug: list Electrometer env vars
-      - name: Dump Electrometer env
+      - name: 🔍 Dump Electrometer env
         run: |
-          echo "ELECTROMETERSETTINGS__BASEURL='$ELECTROMETERSETTINGS__BASEURL'"
-          echo "ELECTROMETERSETTINGS__LOGINURL='$ELECTROMETERSETTINGS__LOGINURL'"
-        # no env here—this step just shows if they're set by the job-level env
+          echo "BASEURL='$ELECTROMETERSETTINGS__BASEURL'"
+          echo "LOGINURL='$ELECTROMETERSETTINGS__LOGINURL'"
+          echo "USERNAME='$ELECTROMETERSETTINGS__USERNAME'"
+          echo "PASSWORD='$ELECTROMETERSETTINGS__PASSWORD'"
+          echo "SYSSN='$ELECTROMETERSETTINGS__SYSSN'"
+          echo "STATIONID='$ELECTROMETERSETTINGS__STATIONID'"
+          echo "DB='$DATABASE__CONNECTIONSTRING'"
 
       - name: Restore & Build
         run: dotnet build ElektrometerService.sln --configuration Release
 
       - name: Run fetcher
-        env:
-          ELECTROMETERSETTINGS__BASEURL:    ${{ secrets.ELECTROMETERSETTINGS__BASEURL }}
-          ELECTROMETERSETTINGS__LOGINURL:   ${{ secrets.ELECTROMETERSETTINGS__LOGINURL }}
-          ELECTROMETERSETTINGS__USERNAME:   ${{ secrets.ELECTROMETERSETTINGS__USERNAME }}
-          ELECTROMETERSETTINGS__PASSWORD:   ${{ secrets.ELECTROMETERSETTINGS__PASSWORD }}
-          ELECTROMETERSETTINGS__SYSN:       ${{ secrets.ELECTROMETERSETTINGS__SYSN }}
-          ELECTROMETERSETTINGS__STATIONID:  ${{ secrets.ELECTROMETERSETTINGS__STATIONID }}
-          DATABASE__CONNECTIONSTRING:       ${{ secrets.DATABASE__CONNECTIONSTRING }}
-        run: |
-          dotnet run \
-            --project ElektrometerService/ElektrometerService.csproj \
-            --configuration Release
+        run: dotnet run --project ElektrometerService/ElektrometerService.csproj --configuration Release
