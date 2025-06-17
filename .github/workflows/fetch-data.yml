@@ -1,0 +1,37 @@
+name: Fetch Electrometer Data
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+
+    env:
+      ELECTROMETERSETTINGS__BASEURL:       ${{ secrets.ELECTROMETERSETTINGS__BASEURL }}
+      ELECTROMETERSETTINGS__LOGINURL:      ${{ secrets.ELECTROMETERSETTINGS__LOGINURL }}
+      ELECTROMETERSETTINGS__USERNAME:      ${{ secrets.ELECTROMETERSETTINGS__USERNAME }}
+      ELECTROMETERSETTINGS__PASSWORD:      ${{ secrets.ELECTROMETERSETTINGS__PASSWORD }}
+      ELECTROMETERSETTINGS__SYSN:          ${{ secrets.ELECTROMETERSETTINGS__SYSN }}
+      ELECTROMETERSETTINGS__STATIONID:     ${{ secrets.ELECTROMETERSETTINGS__STATIONID }}
+      DATABASE__CONNECTIONSTRING:          ${{ secrets.DATABASE__CONNECTIONSTRING }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.x'
+
+      - name: Restore & Build
+        run: dotnet build ElektrometerService.sln --configuration Release
+
+      - name: Run fetcher
+        run: |
+          dotnet run \
+            --project ElektrometerService/ElektrometerService.csproj \
+            --configuration Release
