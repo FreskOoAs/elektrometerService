@@ -1,0 +1,6 @@
+sc create ElectrometerService binPath= "C:\ElectrometerService\ElektrometerService.exe" - install the service permanently
+
+net start ElectrometerService - start
+net stop ElectrometerService - stop
+
+sc query ElectrometerService - check status
