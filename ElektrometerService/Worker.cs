@@ -1,301 +1,216 @@
 ﻿using Microsoft.Extensions.Options;
 using Npgsql;
 using System.Net.Http.Headers;
-using System.Text;
 using System.Text.Json;
 
 namespace ElektrometerService
 {
-    public class Worker : BackgroundService
+    /// <summary>
+    /// Background service that polls the electrometer API and stores data into PostgreSQL
+    /// via fn_t_data_fv_ex_ins_upd, then logs the result code for specific sensors and writes to file.
+    /// </summary>
+    public sealed class Worker : BackgroundService
     {
-        private readonly ILogger<Worker> logger;
-        private readonly HttpClient httpClient;
-        private readonly ElectrometerSettings settings;
-        private readonly OutputSettings outputSettings;
-        private readonly string dbConnectionString;
-        private readonly SemaphoreSlim semaphore = new SemaphoreSlim(1, 1);
-        private DateTime tokenExpiration = DateTime.UtcNow;
-        private string token = string.Empty;
-        private Timer? timer;
+        private readonly ILogger<Worker> _logger;
+        private readonly HttpClient _httpClient;
+        private readonly ElectrometerSettings _settings;
+        private readonly string _connectionString;
+        private readonly string _logFilePath;
+        private readonly JsonSerializerOptions _jsonOptions = new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        };
 
         public Worker(
             ILogger<Worker> logger,
-            IOptions<ElectrometerSettings> config,
-            IOptions<OutputSettings> outputConfig,
-            IOptions<DatabaseOptions> dbOptions)
+            IOptions<ElectrometerSettings> settings,
+            IOptions<DatabaseOptions> dbOptions,
+            IOptions<DataFvExSettings> dataSettings)
         {
-            this.logger = logger;
-            settings = config.Value;
-            outputSettings = outputConfig.Value;
-            dbConnectionString = dbOptions.Value.ConnectionString;
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
+            _connectionString = dbOptions?.Value?.ConnectionString
+                ?? throw new ArgumentNullException(nameof(dbOptions));
+            _logFilePath = dataSettings?.Value?.LogFilePath
+                ?? throw new ArgumentNullException(nameof(dataSettings));
 
             var handler = new SocketsHttpHandler
             {
                 PooledConnectionLifetime = TimeSpan.FromMinutes(15)
             };
-            httpClient = new HttpClient(handler)
+            _httpClient = new HttpClient(handler)
             {
-                BaseAddress = new Uri(settings.BaseUrl)
+                BaseAddress = new Uri(_settings.BaseUrl),
+                Timeout = TimeSpan.FromSeconds(100)
             };
         }
 
-        protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            logger.LogInformation("Electrometer Service Started.");
-            timer = new Timer(async _ => await FetchDataAsync(),
-                              null,
-                              TimeSpan.Zero,
-                              TimeSpan.FromMinutes(settings.FetchIntervalMinutes));
-            return Task.CompletedTask;
-        }
+            _logger.LogInformation("Electrometer Service started at {Time}", DateTimeOffset.UtcNow);
 
-        private async Task FetchDataAsync()
-        {
-            if (!await semaphore.WaitAsync(0))
+            while (!stoppingToken.IsCancellationRequested)
             {
-                logger.LogWarning("Previous execution still running. Skipping.");
-                return;
-            }
-
-            try
-            {
-                if (DateTime.UtcNow >= tokenExpiration)
+                try
                 {
-                    logger.LogInformation("Token expired. Logging in...");
-                    await LoginAsync();
+                    await ProcessCycleAsync(stoppingToken).ConfigureAwait(false);
                 }
-                await FetchElectrometerDataAsync();
-            }
-            finally
-            {
-                semaphore.Release();
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error during fetch-insert cycle.");
+                }
+
+                await Task.Delay(TimeSpan.FromMinutes(_settings.FetchIntervalMinutes), stoppingToken)
+                    .ConfigureAwait(false);
             }
         }
 
-        private async Task FetchElectrometerDataAsync()
+        private async Task ProcessCycleAsync(CancellationToken cancellationToken)
         {
-            httpClient.DefaultRequestHeaders.Authorization =
-                new AuthenticationHeaderValue("Bearer", token);
+            var token = await AcquireTokenAsync(cancellationToken).ConfigureAwait(false);
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            var today = DateTime.UtcNow.ToString("yyyy-MM-dd");
 
-            string today = DateTime.UtcNow.ToString("yyyy-MM-dd");
+            var liveApi = await FetchAsync<ApiResponse<LiveData>>(
+                $"api/report/energyStorage/getLastPowerData?sysSn={_settings.SysSn}&stationId={_settings.StationId}",
+                cancellationToken).ConfigureAwait(false);
 
-            // 1) Live power data
-            var liveUrl =
-                $"api/report/energyStorage/getLastPowerData?sysSn={settings.SysSn}&stationId={settings.StationId}";
-            logger.LogInformation("Calling Live URL: " + new Uri(httpClient.BaseAddress!, liveUrl));
-            using var liveResp = await httpClient.GetAsync(liveUrl);
-            liveResp.EnsureSuccessStatusCode();
-            var liveApi = await JsonSerializer.DeserializeAsync<ApiResponse<LiveData>>(
-                await liveResp.Content.ReadAsStreamAsync(),
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
-            );
+            var dayApi = await FetchAsync<ApiResponse<DailyData>>(
+                $"api/report/power/staticsByDay?sysSn={_settings.SysSn}&date={today}",
+                cancellationToken).ConfigureAwait(false);
 
-            // 2) Daily energy totals
-            var dayUrl =
-                $"api/report/power/staticsByDay?sysSn={settings.SysSn}&date={today}";
-            logger.LogInformation("Calling Day URL: " + new Uri(httpClient.BaseAddress!, dayUrl));
-            using var dayResp = await httpClient.GetAsync(dayUrl);
-            dayResp.EnsureSuccessStatusCode();
-            var dayApi = await JsonSerializer.DeserializeAsync<ApiResponse<DailyData>>(
-                await dayResp.Content.ReadAsStreamAsync(),
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
-            );
+            var statsApi = await FetchAsync<ApiResponse<StatsData>>(
+                $"api/report/energy/getEnergyStatistics?sysSn={_settings.SysSn}&stationId=&beginDate={today}&endDate={today}",
+                cancellationToken).ConfigureAwait(false);
 
-            // 3) Self-consumption & generator stats
-            var statsUrl =
-                $"api/report/energy/getEnergyStatistics?sysSn={settings.SysSn}&stationId=&beginDate={today}&endDate={today}";
-            logger.LogInformation("Calling Stats URL: " + new Uri(httpClient.BaseAddress!, statsUrl));
-            using var statsResp = await httpClient.GetAsync(statsUrl);
-            statsResp.EnsureSuccessStatusCode();
-            var statsApi = await JsonSerializer.DeserializeAsync<ApiResponse<StatsData>>(
-                await statsResp.Content.ReadAsStreamAsync(),
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
-            );
-
-            var outData = new ElectrometerOutput
+            var output = new ElectrometerOutput
             {
-                CentralId = settings.CentralId,
-                Timestamp = DateTime.UtcNow,
-                Generation = liveApi.Data.Ppv / 1000.0,
-                Consumption = liveApi.Data.Pload / 1000.0,
-                BatterySOC = liveApi.Data.Soc,
-                GridConsumption = liveApi.Data.Pgrid / 1000.0,
-                BatteryPower = liveApi.Data.Pbat / 1000.0,
-                HasChargingPile = liveApi.Data.HasChargingPile,
-                EpvToday = dayApi.Data.EpvToday,
-                EfeedIn = dayApi.Data.EfeedIn,
-                EhomeLoad = dayApi.Data.EhomeLoad,
-                Echarge = dayApi.Data.Echarge,
-                Ebat = dayApi.Data.Ebat,
-                EgridCharge = dayApi.Data.EgridCharge,
-                Einput = dayApi.Data.Einput,
-                EloadRaw = dayApi.Data.EloadRaw,
-                EchargingPile = dayApi.Data.EchargingPile,
-                Ediesel = dayApi.Data.Ediesel,
-                EselfConsumption = statsApi.Data.EselfConsumption,
-                EselfSufficiency = statsApi.Data.EselfSufficiency,
-                Edischarge = statsApi.Data.Edischarge,
-                HasGenerator = statsApi.Data.HasGenerator
+                CentralId = _settings.CentralId,
+                Timestamp = DateTime.Now, //DateTime.UtcNow
+                Generation = (liveApi?.Data?.Ppv ?? 0) / 1000.0,
+                Consumption = (liveApi?.Data?.Pload ?? 0) / 1000.0,
+                BatterySOC = liveApi?.Data?.Soc ?? 0,
+                GridConsumption = (liveApi?.Data?.Pgrid ?? 0) / 1000.0,
+                BatteryPower = (liveApi?.Data?.Pbat ?? 0) / 1000.0,
+                HasChargingPile = liveApi?.Data?.HasChargingPile ?? false,
+
+                EpvToday = dayApi?.Data?.EpvToday ?? 0,
+                EfeedIn = dayApi?.Data?.EfeedIn ?? 0,
+                EhomeLoad = dayApi?.Data?.EhomeLoad ?? 0,
+                Echarge = dayApi?.Data?.Echarge ?? 0,
+                Ebat = dayApi?.Data?.Ebat ?? 0,
+                EgridCharge = dayApi?.Data?.EgridCharge ?? 0,
+                Einput = dayApi?.Data?.Einput ?? 0,
+                EloadRaw = dayApi?.Data?.EloadRaw ?? 0,
+                EchargingPile = dayApi?.Data?.EchargingPile ?? 0,
+                Ediesel = dayApi?.Data?.Ediesel ?? 0,
+
+                EselfConsumption = statsApi?.Data?.EselfConsumption ?? 0,
+                EselfSufficiency = statsApi?.Data?.EselfSufficiency ?? 0,
+                Edischarge = statsApi?.Data?.Edischarge ?? 0,
+                HasGenerator = statsApi?.Data?.HasGenerator ?? false
             };
 
-            // Dump to JSON
-            var fileName = $"{DateTime.Now:yyyy-MM-dd}_kveto.json";
-            var filePath = Path.Combine(outputSettings.JsonFilePath, fileName);
-            var json = JsonSerializer.Serialize(outData, new JsonSerializerOptions { WriteIndented = true });
-            await File.AppendAllTextAsync(filePath, json + Environment.NewLine);
-            logger.LogInformation($"Wrote data snapshot to {filePath}");
-
-            await InsertToDatabaseAsync(outData);
+            await InsertAsync(output, cancellationToken).ConfigureAwait(false);
         }
 
-        private async Task InsertToDatabaseAsync(ElectrometerOutput data)
+        private async Task<T> FetchAsync<T>(string requestUri, CancellationToken cancellationToken)
         {
-            await using var conn = new NpgsqlConnection(dbConnectionString);
-            await conn.OpenAsync();
-
-            // use hard-coded SensorId from settings
-            var snimacId = settings.SensorId;
-
-            // force the timestamp into UTC
-            var utcTimestamp = DateTime.SpecifyKind(data.Timestamp, DateTimeKind.Utc);
-
-            // define the 2019-01-01 epoch in UTC
-            var epochUtc = new DateTime(2019, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-
-            // compute whole hours between them
-            int timestampZaokruhl = (int)((utcTimestamp - epochUtc).TotalHours);
-
-            const string insertSql = @"
-INSERT INTO edison.t_data_fv_ex (
-    xdfe_sni_id,
-    dfe_cas,
-    dfe_cas_zaokruhl,
-    dfe_generation_kw,
-    dfe_consumption_kw,
-    dfe_battery_soc_percent,
-    dfe_grid_consumption_kw,
-    dfe_battery_power_kw,
-    dfe_epv_today_kwh,
-    dfe_efeed_in_kwh,
-    dfe_ehome_load_kwh,
-    dfe_echarge_kwh,
-    dfe_ebat_kwh,
-    dfe_egrid_charge_kwh,
-    dfe_einput_kwh,
-    dfe_eload_raw_kwh,
-    dfe_echarging_pile_kwh,
-    dfe_ediesel_kwh,
-    dfe_eself_consumption_kwh,
-    dfe_eself_sufficiency_percent,
-    dfe_edischarge_kwh,
-    dfe_has_generator,
-    dfe_has_charging_pile
-) VALUES (
-    @snimacid,
-    @timestamp,
-    @timestampzaokruhl,
-    @generation_kw,
-    @consumption_kw,
-    @battery_soc_percent,
-    @grid_consumption_kw,
-    @battery_power_kw,
-    @epv_today_kwh,
-    @efeed_in_kwh,
-    @ehome_load_kwh,
-    @echarge_kwh,
-    @ebat_kwh,
-    @egrid_charge_kwh,
-    @einput_kwh,
-    @eload_raw_kwh,
-    @echarging_pile_kwh,
-    @ediesel_kwh,
-    @eself_consumption_kwh,
-    @eself_sufficiency_percent,
-    @edischarge_kwh,
-    @has_generator,
-    @has_charging_pile
-)ON CONFLICT (xdfe_sni_id, dfe_cas_zaokruhl) DO NOTHING;;";
-
-
-            await using var cmdIns = new NpgsqlCommand(insertSql, conn);
-            cmdIns.Parameters.AddWithValue("snimacid", snimacId);
-            cmdIns.Parameters.AddWithValue("timestamp", data.Timestamp);
-            cmdIns.Parameters.AddWithValue("timestampzaokruhl", timestampZaokruhl);
-
-            // Live power (kW)
-            cmdIns.Parameters.AddWithValue("generation_kw", data.Generation);
-            cmdIns.Parameters.AddWithValue("consumption_kw", data.Consumption);
-            cmdIns.Parameters.AddWithValue("battery_soc_percent", data.BatterySOC);
-            cmdIns.Parameters.AddWithValue("grid_consumption_kw", data.GridConsumption);
-            cmdIns.Parameters.AddWithValue("battery_power_kw", data.BatteryPower);
-
-            // Daily totals (kWh)
-            cmdIns.Parameters.AddWithValue("epv_today_kwh", data.EpvToday);
-            cmdIns.Parameters.AddWithValue("efeed_in_kwh", data.EfeedIn);
-            cmdIns.Parameters.AddWithValue("ehome_load_kwh", data.EhomeLoad);
-            cmdIns.Parameters.AddWithValue("echarge_kwh", data.Echarge);
-            cmdIns.Parameters.AddWithValue("ebat_kwh", data.Ebat);
-            cmdIns.Parameters.AddWithValue("egrid_charge_kwh", data.EgridCharge);
-            cmdIns.Parameters.AddWithValue("einput_kwh", data.Einput);
-            cmdIns.Parameters.AddWithValue("eload_raw_kwh", data.EloadRaw);
-            cmdIns.Parameters.AddWithValue("echarging_pile_kwh", data.EchargingPile);
-            cmdIns.Parameters.AddWithValue("ediesel_kwh", data.Ediesel);
-
-            // Self-consumption & stats
-            cmdIns.Parameters.AddWithValue("eself_consumption_kwh", data.EselfConsumption);
-            cmdIns.Parameters.AddWithValue("eself_sufficiency_percent", data.EselfSufficiency);
-            cmdIns.Parameters.AddWithValue("edischarge_kwh", data.Edischarge);
-            cmdIns.Parameters.AddWithValue("has_generator", data.HasGenerator);
-            cmdIns.Parameters.AddWithValue("has_charging_pile", data.HasChargingPile ?? (object)DBNull.Value);
-
-            await cmdIns.ExecuteNonQueryAsync();
-            logger.LogInformation($"Inserted snapshot into t_data_fv_ex under sensor {snimacId}.");
+            using var response = await _httpClient.GetAsync(requestUri, cancellationToken).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            var result = await JsonSerializer.DeserializeAsync<T>(stream, _jsonOptions, cancellationToken)
+                .ConfigureAwait(false);
+            return result ?? throw new JsonException($"Deserialization returned null for {requestUri}");
         }
 
-
-        private async Task LoginAsync()
+        private async Task<string> AcquireTokenAsync(CancellationToken cancellationToken)
         {
-            try
+            var payload = new { username = _settings.Username, password = _settings.Password };
+            using var content = new StringContent(JsonSerializer.Serialize(payload), System.Text.Encoding.UTF8, "application/json");
+            using var response = await _httpClient.PostAsync(_settings.LoginUrl, content, cancellationToken)
+                .ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            var auth = await JsonSerializer.DeserializeAsync<ApiResponse<AuthData>>(stream, _jsonOptions, cancellationToken)
+                .ConfigureAwait(false);
+            return auth?.Data?.Token ?? throw new InvalidOperationException("Authentication token is missing in response.");
+        }
+
+        private async Task InsertAsync(ElectrometerOutput data, CancellationToken cancellationToken)
+        {
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+            var ts = DateTime.SpecifyKind(data.Timestamp, DateTimeKind.Unspecified);
+            const string sql = @"
+SELECT edison.fn_t_data_fv_ex_ins_upd(
+    $1::bigint,
+    $2::timestamp without time zone,
+    $3::numeric,
+    $4::numeric,
+    $5::numeric,
+    $6::numeric,
+    $7::numeric,
+    $8::numeric,
+    $9::numeric,
+    $10::numeric,
+    $11::numeric,
+    $12::numeric,
+    $13::numeric,
+    $14::numeric,
+    $15::numeric,
+    $16::numeric,
+    $17::numeric,
+    $18::numeric,
+    $19::numeric,
+    $20::numeric,
+    $21::boolean,
+    $22::boolean
+);";
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (long)_settings.SensorId });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = ts });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.Generation });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.Consumption });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.BatterySOC });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.GridConsumption });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.BatteryPower });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.EpvToday });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.EfeedIn });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.EhomeLoad });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.Echarge });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.Ebat });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.EgridCharge });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.Einput });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.EloadRaw });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.EchargingPile });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.Ediesel });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.EselfConsumption });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.EselfSufficiency });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = (decimal)data.Edischarge });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = data.HasGenerator });
+            cmd.Parameters.Add(new NpgsqlParameter { Value = data.HasChargingPile });
+
+            var raw = await cmd.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            var returnCode = raw is short s ? s : Convert.ToInt16(raw);
+
+            if (returnCode == 1 || returnCode == 2 || returnCode == -1)
             {
-                var loginPayload = new
+                _logger.LogInformation(
+                    "fn_t_data_fv_ex_ins_upd returned {ReturnCode} for sensor {SensorId}",
+                    returnCode, _settings.SensorId);
+                try
                 {
-                    username = settings.Username,
-                    password = settings.Password
-                };
-
-                using var content = new StringContent(
-                    JsonSerializer.Serialize(loginPayload),
-                    Encoding.UTF8,
-                    "application/json"
-                );
-                using var response = await httpClient.PostAsync(settings.LoginUrl, content);
-                await using var responseStream = await response.Content.ReadAsStreamAsync();
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    logger.LogError($"Login failed: {response.StatusCode}");
-                    return;
+                    await File.AppendAllTextAsync(_logFilePath,
+                        $"{DateTime.UtcNow:O} - fn_t_data_fv_ex_ins_upd returned {returnCode} for sensor {_settings.SensorId}{Environment.NewLine}",
+                        cancellationToken);
                 }
-
-                var authResponse = await JsonSerializer.DeserializeAsync<ApiResponse<AuthData>>(
-                    responseStream,
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
-);
-
-                if (authResponse?.Data?.Token != null)
+                catch (Exception ex)
                 {
-                    token = authResponse.Data.Token;
-                    tokenExpiration = DateTime.UtcNow.AddMinutes(60);
-                    logger.LogInformation("Login successful. Token acquired.");
+                    _logger.LogError(ex, "Failed to write return code to log file");
                 }
-                else
-                {
-                    logger.LogError("Login response did not contain a token.");
-                }
-            }
-            catch (Exception ex)
-            {
-                logger.LogError($"Error logging in: {ex.Message}");
             }
         }
     }

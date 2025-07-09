@@ -13,6 +13,8 @@ IHostBuilder hostBuilder = Host.CreateDefaultBuilder(args)
             hostContext.Configuration.GetSection("OutputSettings"));
         services.Configure<DatabaseOptions>(
             hostContext.Configuration.GetSection("Database"));
+        services.Configure<DataFvExSettings>(
+            hostContext.Configuration.GetSection("DataFvEx"));
 
         services.AddHostedService<Worker>();
     });
